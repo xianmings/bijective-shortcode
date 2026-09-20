@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from shortcode import (  # noqa: E402
     DEFAULT_SEED,
     BijectiveScheme,
+    FeistelPermutation,
+    FeistelScheme,
     HashScheme,
     ModPowPermutation,
     SequentialScheme,
@@ -217,6 +219,9 @@ def _schemes(length: int = 6) -> list:
         BijectiveScheme(
             ModPowPermutation.for_code_length(length, rng=random.Random(11)), length
         ),
+        FeistelScheme(
+            FeistelPermutation.for_code_length(length, key=b"test"), length
+        ),
     ]
 
 
@@ -318,6 +323,122 @@ def test_default_seed_constant_is_used():
     """默认偏移取自常量,改了要能被测试发现。"""
     assert BijectiveScheme().seed == DEFAULT_SEED
     assert DEFAULT_SEED != 0
+
+
+# --------------------------------------------------------------------------
+# Feistel 网络
+# --------------------------------------------------------------------------
+
+def test_feistel_is_bijective_exhaustively():
+    """穷举小容量,证明 Feistel + cycle walking 在目标区间上不重不漏。
+
+    Feistel 本身只作用在 2 的幂大小的空间上,靠 cycle walking 把结果收窄到
+    目标区间。这一步最容易写错 —— 收窄时稍有不慎就不再是置换。
+    """
+    perm = FeistelPermutation.for_code_length(EXHAUSTIVE_LENGTH, key=b"test")
+    outputs = {perm.shuffle(x) for x in range(perm.capacity)}
+    assert len(outputs) == perm.capacity
+    assert outputs == set(range(perm.capacity))
+
+
+def test_feistel_roundtrip_exhaustively():
+    perm = FeistelPermutation.for_code_length(EXHAUSTIVE_LENGTH, key=b"test")
+    assert all(perm.unshuffle(perm.shuffle(x)) == x for x in range(perm.capacity))
+
+
+def test_feistel_output_never_escapes_range():
+    """收窄后的输出必须严格落在 [0, capacity)。"""
+    perm = FeistelPermutation.for_code_length(EXHAUSTIVE_LENGTH, key=b"test")
+    assert all(0 <= perm.shuffle(x) < perm.capacity for x in range(perm.capacity))
+
+
+def test_feistel_roundtrip_at_real_size():
+    perm = FeistelPermutation.for_code_length(6, key=b"test")
+    rng = random.Random(99)
+    for _ in range(5000):
+        x = rng.randrange(perm.capacity)
+        assert perm.unshuffle(perm.shuffle(x)) == x
+
+
+def test_feistel_rejects_too_few_rounds():
+    """轮数低于 Luby-Rackoff 下界(3)时必须拒绝构造。
+
+    轮数不够时它仍是个合法置换,但和随机置换可区分 —— 这种缺陷不会在
+    功能测试里暴露,只能靠构造期拦截。
+    """
+    for rounds in (1, 2):
+        try:
+            FeistelPermutation(1000, b"k", rounds=rounds)
+        except ValueError as exc:
+            assert "Luby-Rackoff" in str(exc)
+        else:
+            raise AssertionError(f"rounds={rounds} should be rejected")
+
+
+def test_feistel_rejects_bad_arguments():
+    try:
+        FeistelPermutation(1000, b"")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("empty key should be rejected")
+
+    perm = FeistelPermutation(1000, b"k")
+    for bad in (-1, 1000, 1001):
+        try:
+            perm.shuffle(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"should have rejected {bad}")
+
+
+def test_feistel_key_is_deterministic_and_significant():
+    """同一个密钥必须给出同一套短码,换密钥必须打乱。"""
+    a = FeistelPermutation.for_code_length(6, key=b"same")
+    b = FeistelPermutation.for_code_length(6, key=b"same")
+    assert all(a.shuffle(x) == b.shuffle(x) for x in range(2000))
+
+    c = FeistelPermutation.for_code_length(6, key=b"other")
+    assert any(a.shuffle(x) != c.shuffle(x) for x in range(2000))
+
+
+def test_feistel_walk_steps_match_block_ratio():
+    perm = FeistelPermutation.for_code_length(6, key=b"test")
+    assert perm.expected_walk_steps == (1 << perm.block_bits) / perm.capacity
+    assert 1.0 <= perm.expected_walk_steps < 1.5
+
+
+def test_feistel_uses_whole_code_space():
+    """Feistel 能发出全部 62^length 个短码;模幂覆盖不全。
+
+    这是 Feistel 相对模幂的核心优势:模幂的模数必须是两个素数之积,
+    为了塞进 62^length 只能取更小的素数对,必然漏掉一部分码位。
+    """
+    length = 2
+    space = base62.capacity(length)
+    all_codes = {base62.encode(v, length) for v in range(space)}
+
+    feistel = FeistelPermutation.for_code_length(length, key=b"test")
+    assert {base62.encode(feistel.shuffle(v), length) for v in range(space)} == all_codes
+
+    modpow = ModPowPermutation.for_code_length(length, rng=random.Random(1))
+    modpow_codes = {
+        base62.encode(modpow.shuffle(v), length) for v in range(modpow.capacity)
+    }
+    assert modpow_codes < all_codes, "modpow should leave part of the space unused"
+
+
+def test_permutation_scheme_rejects_out_of_range_seed():
+    scheme = FeistelScheme(
+        FeistelPermutation.for_code_length(2, key=b"test"), length=2
+    )
+    try:
+        FeistelScheme(scheme.permutation, length=2, seed=scheme.permutation.capacity)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("seed outside capacity should be rejected")
 
 
 def _run_all() -> int:
